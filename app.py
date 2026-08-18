@@ -16,6 +16,7 @@ Renderなどのクラウドに置いて動かす。ローカルでも `python3 a
 import os
 import re
 import io
+import base64
 import json
 import time
 import uuid
@@ -29,6 +30,25 @@ PORT = int(os.environ.get("PORT", "8000"))
 UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "print_station_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 MAX_MB = 50
+
+# 先生ページ（閲覧・PDF）を守るパスワード。Renderの Environment で TEACHER_PASSWORD を設定する。
+# 未設定なら、先生側は安全のため停止（児童のデータは誰にも見えない）。
+TEACHER_PASSWORD = os.environ.get("TEACHER_PASSWORD", "").strip()
+PROTECTED = ("/teacher", "/先生", "/api/state", "/file/", "/merge", "/api/delete")
+
+
+def needs_auth(path):
+    return any(path == p or path.startswith(p) for p in PROTECTED)
+
+
+SETUP_HTML = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>準備中</title>
+<style>body{font-family:-apple-system,"Hiragino Sans",sans-serif;background:#fff7f0;color:#333;text-align:center;padding:60px 22px;line-height:1.8}
+h2{color:#c0392b}code{background:#eee;padding:2px 6px;border-radius:5px}</style></head>
+<body><div style="font-size:56px">🔒</div>
+<h2>先生ページは 準備中です</h2>
+<p>安全のため、パスワード（<code>TEACHER_PASSWORD</code>）が設定されるまで<br>先生ページと児童のPDFは表示されません。</p>
+<p>設定すると、パスワードで守られた状態で使えるようになります。</p></body></html>"""
 
 # PDF結合（まとめて印刷）用。無ければ結合機能だけ無効化。
 try:
@@ -312,8 +332,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json(self, obj, code=200):
         self._send(json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8", code)
 
+    def _auth_gate(self, path):
+        """守るべきパスなら認証を要求。OKならTrue、そうでなければ応答を返してFalse。"""
+        if not needs_auth(path):
+            return True
+        if not TEACHER_PASSWORD:
+            self._send(SETUP_HTML, code=503)   # 未設定 → データを見せない
+            return False
+        hdr = self.headers.get("Authorization", "")
+        if hdr.startswith("Basic "):
+            try:
+                dec = base64.b64decode(hdr[6:]).decode("utf-8", "ignore")
+                if dec.partition(":")[2] == TEACHER_PASSWORD:
+                    return True
+            except Exception:
+                pass
+        body = "🔒 先生用パスワードが必要です".encode("utf-8")
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Teacher"')
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
     def do_GET(self):
         path = unquote(self.path.split("?")[0])
+        if not self._auth_gate(path):
+            return
         query = parse_qs(self.path.split("?")[1]) if "?" in self.path else {}
         if path == "/":
             self._send(child_page())
@@ -346,6 +392,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(self.path.split("?")[0])
+        if not self._auth_gate(path):
+            return
         length = int(self.headers.get("Content-Length", 0))
 
         if path == "/submit":
